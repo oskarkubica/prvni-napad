@@ -195,3 +195,388 @@
     .empty .t2{ font-size: 12px; margin-top: 2px; }
 
     /* Notes */
+    .noteWrap{
+      position:absolute;
+      left: 0;
+      top: 0;
+      width: 240px;
+      transform: translate(0px, 0px);
+    }
+    .note{
+      width: 240px;
+      background: var(--note);
+      border: 1px solid var(--noteBorder);
+      border-radius: 18px;
+      padding: 12px;
+      box-shadow: 0 12px 24px rgba(15,23,42,.12);
+      user-select: none;
+      cursor: grab;
+      touch-action: none; /* důležité pro drag na mobilu */
+    }
+    .note:active{ cursor: grabbing; }
+
+    .noteHeader{
+      display:flex;
+      align-items:flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .noteLabel{
+      font-size: 11px;
+      font-weight: 800;
+      color: rgba(120,53,15,.75);
+      letter-spacing: .02em;
+    }
+    .noteDel{
+      border:0;
+      background: transparent;
+      color: rgba(120,53,15,.65);
+      border-radius: 12px;
+      padding: 6px 8px;
+      cursor:pointer;
+      font-weight: 900;
+      line-height: 1;
+    }
+    .noteDel:hover{
+      background:#fef3c7;
+      color: rgba(120,53,15,.95);
+    }
+
+    .noteText{
+      white-space: pre-wrap;
+      font-size: 14px;
+      line-height: 1.35;
+      color: var(--noteText);
+    }
+
+    .noteTime{
+      margin-top: 8px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="grid">
+      <!-- Left panel -->
+      <div class="card">
+        <h1>Nástěnka vzkazů</h1>
+        <p class="sub">Napiš vzkaz → <b>Umístit</b> → klikni na plochu vpravo. Vzkazy přetahuj a smaž.</p>
+
+        <label for="draft">Text vzkazu</label>
+        <textarea id="draft" placeholder="Nech tu vzkaz…"></textarea>
+
+        <div class="row">
+          <button id="btnPlace" class="btn primary" disabled>Umístit</button>
+          <button id="btnCancel" class="btn secondary" disabled>Zrušit (Esc)</button>
+          <button id="btnClear" class="btn danger" disabled>Smazat vše</button>
+        </div>
+
+        <div id="status" class="meta"></div>
+
+        <div class="tip">
+          Ukládání: pouze do prohlížeče (localStorage). Pro sdílení mezi návštěvníky je potřeba backend.
+        </div>
+      </div>
+
+      <!-- Board -->
+      <div id="board" class="board" aria-label="Plocha pro vzkazy">
+        <div id="boardHint" class="boardHint" style="display:none;">Klikni kamkoliv na plochu a vzkaz se umístí.</div>
+        <div id="empty" class="empty" style="display:none;">
+          <div>
+            <div class="icon"></div>
+            <div class="t1">Zatím tu nic není</div>
+            <div class="t2">Vlevo napiš vzkaz a umísti ho na plochu.</div>
+          </div>
+        </div>
+        <div id="notesLayer"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ====== Nastavení ======
+    const KEY = \"msg-board-v1\";
+    const NOTE_W = 240; // px
+    const PAD = 12;     // px
+
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+    // ====== Stav ======
+    let notes = [];
+    let placing = false;
+
+    // drag state
+    const drag = { id: null, pid: null, ox: 0, oy: 0 };
+
+    // ====== DOM ======
+    const board = document.getElementById(\"board\");
+    const notesLayer = document.getElementById(\"notesLayer\");
+    const empty = document.getElementById(\"empty\");
+    const hint = document.getElementById(\"boardHint\");
+
+    const draft = document.getElementById(\"draft\");
+    const btnPlace = document.getElementById(\"btnPlace\");
+    const btnCancel = document.getElementById(\"btnCancel\");
+    const btnClear = document.getElementById(\"btnClear\");
+    const status = document.getElementById(\"status\");
+
+    // ====== LocalStorage ======
+    function load() {
+      try {
+        const raw = localStorage.getItem(KEY);
+        if (raw) {
+          const data = JSON.parse(raw);
+          if (Array.isArray(data)) notes = data;
+        }
+      } catch (e) {}
+    }
+
+    function save() {
+      try {
+        localStorage.setItem(KEY, JSON.stringify(notes));
+      } catch (e) {}
+    }
+
+    // ====== UI helpers ======
+    function pluralCZ(n){
+      if (n === 0) return \"Žádné vzkazy\";
+      if (n === 1) return \"1 vzkaz\";
+      if (n >= 2 && n <= 4) return `${n} vzkazy`;
+      return `${n} vzkazů`;
+    }
+
+    function setPlacing(v){
+      placing = v;
+      board.classList.toggle(\"placing\", placing);
+      hint.style.display = placing ? \"block\" : \"none\";
+      btnCancel.disabled = !placing;
+      renderStatus();
+    }
+
+    function renderStatus(){
+      const n = notes.length;
+      btnClear.disabled = n === 0;
+
+      if (placing) {
+        status.innerHTML = `<span class=\"dot\"></span><span>Režim umisťování: klikni na plochu vpravo</span>`;
+      } else {
+        status.textContent = pluralCZ(n);
+      }
+    }
+
+    function updateButtons(){
+      btnPlace.disabled = !draft.value.trim();
+      // cancel se řídí placing
+      btnCancel.disabled = !placing;
+      btnClear.disabled = notes.length === 0;
+    }
+
+    // ====== Notes logic ======
+    function bringFront(id){
+      const i = notes.findIndex(n => n.id === id);
+      if (i < 0) return;
+      const [it] = notes.splice(i, 1);
+      notes.unshift(it);
+      save();
+      render();
+    }
+
+    function removeNote(id){
+      notes = notes.filter(n => n.id !== id);
+      save();
+      render();
+      renderStatus();
+      updateButtons();
+    }
+
+    function clearAll(){
+      notes = [];
+      try { localStorage.removeItem(KEY); } catch (e) {}
+      render();
+      renderStatus();
+      updateButtons();
+    }
+
+    function addAt(clientX, clientY){
+      const rect = board.getBoundingClientRect();
+      let x = clientX - rect.left;
+      let y = clientY - rect.top;
+
+      // clamp do plochy
+      x = clamp(x, PAD, rect.width - NOTE_W - PAD);
+      y = clamp(y, PAD, rect.height - PAD);
+
+      notes.unshift({
+        id: uid(),
+        text: draft.value.trim(),
+        x, y,
+        t: Date.now()
+      });
+
+      draft.value = \"\";
+      setPlacing(false);
+      save();
+      render();
+      renderStatus();
+      updateButtons();
+    }
+
+    // ====== Render ======
+    function render(){
+      notesLayer.innerHTML = \"\";
+
+      // empty state
+      empty.style.display = (!notes.length && !placing) ? \"grid\" : \"none\";
+
+      notes.forEach((n, i) => {
+        const wrap = document.createElement(\"div\");
+        wrap.className = \"noteWrap\";
+        wrap.style.transform = `translate(${n.x}px, ${n.y}px)`;
+        wrap.style.zIndex = (1000 - i).toString();
+
+        const note = document.createElement(\"div\");
+        note.className = \"note\";
+        note.title = \"Přetáhni pro přesun\";
+        note.setAttribute(\"data-id\", n.id);
+
+        // Stop board click from placing when clicking on note
+        note.addEventListener(\"click\", (e) => e.stopPropagation());
+
+        // Header
+        const header = document.createElement(\"div\");
+        header.className = \"noteHeader\";
+
+        const label = document.createElement(\"div\");
+        label.className = \"noteLabel\";
+        label.textContent = \"Vzkaz\";
+
+        const del = document.createElement(\"button\");
+        del.className = \"noteDel\";
+        del.textContent = \"✕\";
+        del.title = \"Smazat\";
+        del.setAttribute(\"aria-label\", \"Smazat vzkaz\");
+        del.setAttribute(\"data-del\", \"1\");
+        del.addEventListener(\"click\", (e) => {
+          e.stopPropagation();
+          removeNote(n.id);
+        });
+
+        header.appendChild(label);
+        header.appendChild(del);
+
+        // Text
+        const text = document.createElement(\"div\");
+        text.className = \"noteText\";
+        text.textContent = n.text;
+
+        // Time
+        const time = document.createElement(\"div\");
+        time.className = \"noteTime\";
+        time.textContent = new Date(n.t).toLocaleString(\"cs-CZ\", {
+          year: \"numeric\", month: \"2-digit\", day: \"2-digit\",
+          hour: \"2-digit\", minute: \"2-digit\"
+        });
+
+        note.appendChild(header);
+        note.appendChild(text);
+        note.appendChild(time);
+
+        // Pointer events for drag
+        note.addEventListener(\"pointerdown\", (e) => {
+          // ignore delete button
+          if (e.target && e.target.closest && e.target.closest(\"[data-del='1']\")) return;
+
+          bringFront(n.id);
+
+          const rect = board.getBoundingClientRect();
+          const px = e.clientX - rect.left;
+          const py = e.clientY - rect.top;
+
+          // najdi aktuální note po bringFront + render
+          const current = notes.find(x => x.id === n.id);
+          if (!current) return;
+
+          drag.id = n.id;
+          drag.pid = e.pointerId;
+          drag.ox = px - current.x;
+          drag.oy = py - current.y;
+
+          try { note.setPointerCapture(e.pointerId); } catch (err) {}
+        });
+
+        note.addEventListener(\"pointermove\", (e) => {
+          if (!drag.id || drag.pid !== e.pointerId) return;
+
+          const rect = board.getBoundingClientRect();
+          const px = e.clientX - rect.left;
+          const py = e.clientY - rect.top;
+
+          const x = clamp(px - drag.ox, PAD, rect.width - NOTE_W - PAD);
+          const y = clamp(py - drag.oy, PAD, rect.height - PAD);
+
+          notes = notes.map(item => item.id === drag.id ? { ...item, x, y } : item);
+          save();
+
+          // update without full render: move the top note element
+          wrap.style.transform = `translate(${x}px, ${y}px)`;
+        });
+
+        note.addEventListener(\"pointerup\", (e) => {
+          if (drag.pid !== e.pointerId) return;
+          drag.id = null; drag.pid = null; drag.ox = 0; drag.oy = 0;
+        });
+
+        wrap.appendChild(note);
+        notesLayer.appendChild(wrap);
+      });
+    }
+
+    // ====== Events ======
+    draft.addEventListener(\"input\", updateButtons);
+
+    btnPlace.addEventListener(\"click\", () => {
+      if (!draft.value.trim()) return;
+      setPlacing(true);
+      updateButtons();
+      render();
+    });
+
+    btnCancel.addEventListener(\"click\", () => {
+      setPlacing(false);
+      renderStatus();
+      updateButtons();
+      render();
+    });
+
+    btnClear.addEventListener(\"click\", clearAll);
+
+    board.addEventListener(\"click\", (e) => {
+      if (!placing) return;
+      if (!draft.value.trim()) return;
+      addAt(e.clientX, e.clientY);
+    });
+
+    window.addEventListener(\"keydown\", (e) => {
+      if (e.key === \"Escape\") {
+        if (placing) {
+          setPlacing(false);
+          renderStatus();
+          updateButtons();
+          render();
+        }
+      }
+    });
+
+    // ====== Init ======
+    load();
+    render();
+    renderStatus();
+    updateButtons();
+  </script>
+</body>
+</html>
